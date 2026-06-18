@@ -652,21 +652,72 @@ final class ProcessSSHFileExplorerTransport: SSHFileExplorerTransport {
         return result.stdout
     }
 
-    private static func sshArguments(connection: SSHFileExplorerConnection, command: String) -> [String] {
-        var args: [String] = []
+    // Background SSH argument composition for file-explorer probes. Mirrors the
+    // batch/background SSH policy used everywhere else in cmux (the daemon
+    // transport `WorkspaceRemoteConfiguration.batchSSHArguments`, scp uploads in
+    // `TerminalSSHSessionDetector.sshArguments`, and the reverse relay): force the
+    // keepalive/timeout options, `BatchMode=yes`, and crucially `ControlMaster=no`
+    // so the probe *reuses* the workspace's already-warm ControlMaster socket (via
+    // the inherited `ControlPath`) instead of cold-starting its own master through a
+    // slow ProxyCommand. The workspace's `ssh_options` arrive carrying
+    // `ControlMaster=auto`/`ControlPersist=600`; those are stripped so our
+    // `ControlMaster=no` wins, while `ControlPath` is kept so an existing master is
+    // reused. Without this, proxied hosts (e.g. Coder `*.coder` ProxyCommand) make
+    // each probe negotiate a fresh master and time out, while the interactive
+    // terminal — which never sets `ControlMaster=auto` itself — keeps working.
+    static func sshArguments(connection: SSHFileExplorerConnection, command: String) -> [String] {
+        let effectiveSSHOptions = backgroundSSHOptions(connection.sshOptions)
+        var args: [String] = [
+            "-T",
+            "-o", "ConnectTimeout=6",
+            "-o", "ServerAliveInterval=20",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "BatchMode=yes",
+            "-o", "ControlMaster=no",
+        ]
         if let port = connection.port {
             args += ["-p", String(port)]
         }
         if let identityFile = connection.identityFile {
             args += ["-i", identityFile]
         }
-        for option in connection.sshOptions {
+        if !hasSSHOptionKey(effectiveSSHOptions, key: "StrictHostKeyChecking") {
+            args += ["-o", "StrictHostKeyChecking=accept-new"]
+        }
+        for option in effectiveSSHOptions {
             args += ["-o", option]
         }
-        // Batch mode, no TTY, connection timeout
-        args += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T"]
         args += [connection.destination, command]
         return args
+    }
+
+    // Trims the inherited options and drops `ControlMaster`/`ControlPersist`
+    // (keeping `ControlPath`, so the probe can reuse the workspace's existing
+    // master socket rather than negotiating its own).
+    static func backgroundSSHOptions(_ options: [String]) -> [String] {
+        let dropKeys: Set<String> = ["controlmaster", "controlpersist"]
+        return options.compactMap { option in
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }.filter { option in
+            guard let key = sshOptionKey(option) else { return true }
+            return !dropKeys.contains(key)
+        }
+    }
+
+    static func hasSSHOptionKey(_ options: [String], key: String) -> Bool {
+        let loweredKey = key.lowercased()
+        return options.contains { sshOptionKey($0) == loweredKey }
+    }
+
+    private static func sshOptionKey(_ option: String) -> String? {
+        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+            .split(whereSeparator: { $0 == "=" || $0.isWhitespace })
+            .first
+            .map(String.init)?
+            .lowercased()
     }
 
     private static func runSSHListCommand(
@@ -715,9 +766,109 @@ enum FileExplorerError: LocalizedError {
         switch self {
         case .providerUnavailable:
             return String(localized: "fileExplorer.error.unavailable", defaultValue: "File explorer is not available")
-        case .sshCommandFailed:
-            return String(localized: "fileExplorer.error.sshFailed", defaultValue: "SSH command failed")
+        case .sshCommandFailed(let detail):
+            return Self.failureCategory(for: detail).localizedDescription
         }
+    }
+
+    /// A user-facing classification of an SSH probe failure.
+    ///
+    /// Raw `ssh` stderr is mapped into one of these categories so the explorer can
+    /// tell the user *what kind* of failure happened (timeout, auth, host key, …)
+    /// without ever surfacing SSH-internal tokens such as `ControlPath` socket
+    /// paths, `ProxyCommand` invocations, or internal hostnames. This keeps the
+    /// error self-diagnosing while honoring the user-facing-error privacy rule.
+    enum SSHFailureCategory {
+        case timedOut
+        case authenticationFailed
+        case connectionRefused
+        case hostKeyChanged
+        case hostUnresolved
+        case hostUnreachable
+        case remoteHomeUnresolved
+        case unknown
+
+        /// The localized, cmux-phrased message shown to the user for this category.
+        var localizedDescription: String {
+            switch self {
+            case .timedOut:
+                return String(localized: "fileExplorer.error.ssh.timedOut", defaultValue: "SSH connection timed out")
+            case .authenticationFailed:
+                return String(localized: "fileExplorer.error.ssh.authFailed", defaultValue: "SSH authentication failed")
+            case .connectionRefused:
+                return String(localized: "fileExplorer.error.ssh.connectionRefused", defaultValue: "SSH connection refused")
+            case .hostKeyChanged:
+                return String(localized: "fileExplorer.error.ssh.hostKeyChanged", defaultValue: "SSH host key verification failed")
+            case .hostUnresolved:
+                return String(localized: "fileExplorer.error.ssh.hostUnresolved", defaultValue: "Couldn't resolve the SSH host")
+            case .hostUnreachable:
+                return String(localized: "fileExplorer.error.ssh.hostUnreachable", defaultValue: "SSH host is unreachable")
+            case .remoteHomeUnresolved:
+                return String(localized: "fileExplorer.error.ssh.remoteHomeUnresolved", defaultValue: "Couldn't determine the remote home directory")
+            case .unknown:
+                return String(localized: "fileExplorer.error.sshFailed", defaultValue: "SSH command failed")
+            }
+        }
+    }
+
+    /// Classifies raw `ssh` stderr (and cmux's own internal failure strings) into
+    /// a user-facing ``SSHFailureCategory``.
+    ///
+    /// Scans the meaningful stderr lines bottom-up (skipping benign
+    /// ProxyCommand/login banners such as Coder version-mismatch or
+    /// "workspace is outdated" notices) and returns the first category that
+    /// matches a known failure signature, or ``SSHFailureCategory/unknown`` when
+    /// nothing matches. The raw text is only inspected here and is never returned
+    /// to the caller, so no SSH-internal detail can leak into the UI.
+    static func failureCategory(for stderr: String) -> SSHFailureCategory {
+        let lines = stderr
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !isNoiseLine($0) }
+        for line in lines.reversed() {
+            let lowered = line.lowercased()
+            if lowered.contains("timed out") || lowered.contains("timeout") {
+                return .timedOut
+            }
+            if lowered.contains("permission denied")
+                || lowered.contains("publickey")
+                || lowered.contains("authentication failed")
+                || lowered.contains("too many authentication failures") {
+                return .authenticationFailed
+            }
+            if lowered.contains("connection refused") {
+                return .connectionRefused
+            }
+            if lowered.contains("host key verification failed")
+                || lowered.contains("remote host identification has changed") {
+                return .hostKeyChanged
+            }
+            if lowered.contains("could not resolve hostname")
+                || lowered.contains("name or service not known")
+                || lowered.contains("nodename nor servname") {
+                return .hostUnresolved
+            }
+            if lowered.contains("no route to host") || lowered.contains("network is unreachable") {
+                return .hostUnreachable
+            }
+            if lowered.contains("remote home was empty") {
+                return .remoteHomeUnresolved
+            }
+        }
+        return .unknown
+    }
+
+    /// Whether `line` is a benign ProxyCommand/login banner that should be ignored
+    /// when classifying a failure (so a real error printed below it still wins).
+    private static func isNoiseLine(_ line: String) -> Bool {
+        let lowered = line.lowercased()
+        if lowered.hasPrefix("warning: permanently added") { return true }
+        if lowered.hasPrefix("debug") { return true }
+        if lowered.contains("pseudo-terminal will not be allocated") { return true }
+        if lowered.contains("workspace is outdated") { return true }
+        if lowered.hasPrefix("version mismatch") { return true }
+        if lowered.hasPrefix("download ") { return true }
+        return false
     }
 }
 
@@ -1423,13 +1574,17 @@ enum GitStatusProvider {
     ) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        var args: [String] = []
-        if let port { args += ["-p", String(port)] }
-        if let identityFile { args += ["-i", identityFile] }
-        for option in sshOptions { args += ["-o", option] }
-        args += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T"]
-        args += [destination, command]
-        process.arguments = args
+        // Reuse the file explorer's background-SSH policy so git status shares the
+        // workspace's warm ControlMaster instead of cold-starting its own.
+        process.arguments = ProcessSSHFileExplorerTransport.sshArguments(
+            connection: SSHFileExplorerConnection(
+                destination: destination,
+                port: port,
+                identityFile: identityFile,
+                sshOptions: sshOptions
+            ),
+            command: command
+        )
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
